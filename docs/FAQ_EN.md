@@ -86,6 +86,8 @@ This document compiles common issues encountered by users and their solutions.
    - `GEMINI_MODEL`
    - `REPORT_TYPE`
 
+> Compatibility note: the daily analysis workflow also binds the `STOCK_LIST` environment, so a `STOCK_LIST` value mistakenly added under that Environment's variables can still be read. Repository variables remain the recommended location. Unless you want the daily job to wait for manual approval, do not add required reviewers, wait timers, or deployment branch restrictions to this Environment.
+
 ---
 
 ### Q6: Configuration not taking effect after modifying .env file?
@@ -93,11 +95,14 @@ This document compiles common issues encountered by users and their solutions.
 **Solution**:
 1. Ensure `.env` file is in project root directory
 2. **Docker deployment / WebUI Settings**:
-   - WebUI saves `STOCK_LIST`, `SCHEDULE_ENABLED`, `SCHEDULE_TIME`, `SCHEDULE_RUN_IMMEDIATELY`, and `RUN_IMMEDIATELY` back into the container's `.env`
+   - `--env-file .env` / Compose `env_file` only injects the host `.env` as startup environment variables; it does not create or write back to `/app/.env` inside the container
+   - When the active `.env` file does not contain a key, the WebUI Settings page falls back to showing the same key from startup-injected environment variables; the raw `.env` export still contains only the active config file content
+   - WebUI saves `STOCK_LIST`, `SCHEDULE_ENABLED`, `SCHEDULE_TIME`, `SCHEDULE_TIMES`, `SCHEDULE_RUN_IMMEDIATELY`, and `RUN_IMMEDIATELY` back into the container's `.env`
    - Saving from WebUI triggers a config reload for the current process, and runtime reads continue from the latest persisted `.env`; for example, scheduled runs keep hot-reading the saved `STOCK_LIST`
-   - If you also pass these keys explicitly as container process env vars (`docker run -e ...` or Compose `environment:`), those explicit process env overrides still win on later restarts; update or remove them if you want the WebUI-saved `.env` values to take over
-   - `SCHEDULE_*` and `RUN_IMMEDIATELY` are still **startup-time scheduling settings**: saving them does not immediately trigger an analysis run and does not hot-rebuild the scheduler inside the current process
-   - To make schedule changes take over the current container, restart it and make sure the process is started in schedule mode
+   - If you pass the same keys as startup env vars (`--env-file .env`, `docker run -e ...`, or Compose `environment:`), those startup values can still win on later restarts; update or remove the same-name overrides if you want the WebUI-saved `.env` values to take over
+   - To persist WebUI-saved config, point `ENV_FILE` at a writable data-volume file such as `/app/data/runtime.env`; do not bind-mount the host `.env` as a single file over `/app/.env`
+   - Saving `SCHEDULE_ENABLED`, `SCHEDULE_TIME`, or `SCHEDULE_TIMES` starts, stops, or rebuilds the runtime scheduler in long-running WebUI/API/Desktop processes; restarting a `--serve-only` or Desktop process restores enabled daily jobs without immediately running an analysis at startup
+   - `SCHEDULE_RUN_IMMEDIATELY` and `RUN_IMMEDIATELY` remain startup/one-shot settings; saving them does not immediately trigger an analysis run
 3. **Manual `.env` edits in Docker**: Restart the container after changes
    ```bash
    docker-compose down && docker-compose up -d
@@ -130,13 +135,17 @@ PROXY_PORT=10809
 
 The system uses exactly one mode by priority: advanced YAML routing (`LITELLM_CONFIG`) > `LLM_CHANNELS` > legacy keys. However, YAML routing only takes effect when the file can be parsed successfully and yields a non-empty `model_list`; if the YAML path is invalid or the content is empty, the system automatically falls back to `LLM_CHANNELS` or legacy keys. Once a tier is active, lower-priority tiers are not used.
 
-**Q: test_env says no usable AI model is configured, what should I do?**
+**Q: check_env says no usable AI model is configured, what should I do?**
 
-Start with one provider and its API key. If you want to pin a primary model, add `LITELLM_MODEL=provider/model`. If you need multi-model switching, configure `LLM_CHANNELS` or advanced YAML routing. Run `python test_env.py --config` to validate config and `python test_env.py --llm` to actually call the API.
+Start with one provider and its API key. If you want to pin a primary model, add `LITELLM_MODEL=provider/model`. If you need multi-model switching, configure `LLM_CHANNELS` or advanced YAML routing. Run `python scripts/check_env.py --config` to validate config and `python scripts/check_env.py --llm` to actually call the API.
 
 **Q: How to use multiple models at once (e.g. AIHubmix + DeepSeek + Gemini)?**
 
 Use channel mode: set `LLM_CHANNELS=aihubmix,deepseek,gemini` and configure each channel's `LLM_{NAME}_BASE_URL`, `LLM_{NAME}_API_KEY`, `LLM_{NAME}_MODELS`. You can also configure this visually in Web Settings → AI Model → AI Model Access.
+
+**Q: The ask-stock / Agent page says no usable LLM is configured, but I only use legacy `GEMINI_*` / `OPENAI_*` / `ANTHROPIC_*` settings. What should I check?**
+
+First confirm whether `LITELLM_CONFIG` or `LLM_CHANNELS` is active, because either of those tiers overrides legacy keys. If neither tier is active and `AGENT_LITELLM_MODEL` is empty, the ask-stock Agent still inherits legacy provider models automatically: `GEMINI_MODEL`, `OPENAI_MODEL`, and `ANTHROPIC_MODEL` are mapped to LiteLLM provider-prefixed model names for the corresponding runtime. This fix does not silently migrate or clear old settings; it only returns the real backend reason to the frontend so you can see whether the issue is a missing key, a missing model name, or an upper-tier config taking precedence. Full compatibility details are documented in the [LLM Config Guide](LLM_CONFIG_GUIDE_EN.md) under “Ask-Stock Agent / LiteLLM compatibility notes”.
 
 ---
 
@@ -155,8 +164,21 @@ Use channel mode: set `LLM_CHANNELS=aihubmix,deepseek,gemini` and configure each
 1. **Auto-chunking**: Latest version implements automatic long message splitting
 2. **Single stock push mode**: Set `SINGLE_STOCK_NOTIFY=true`, push immediately after each stock analysis
 3. **Brief report**: Set `REPORT_TYPE=simple` for simplified format
+4. **Local file fallback**: Even with no notification channel configured, `SINGLE_STOCK_NOTIFY=true` still saves each stock report to `reports/report_YYYYMMDD_<stock_code>.md`
 
 ---
+
+### Q8.1: Analysis finished, but no report file was created under `reports/`?
+
+**Common causes**:
+1. `STOCK_LIST` is empty and market review was not enabled for this run
+2. The stock list is non-empty, but every stock analysis failed so no successful result was produced
+3. Stock results were produced, but writing to `reports/` failed (for example due to permissions or mount issues)
+
+**Current behavior**:
+1. CLI-triggered analysis now logs the exact failure reason for these cases
+2. Standalone non-`--serve` runs now return a non-zero exit code so workflows do not treat “no report generated” as success
+3. In single-stock push mode, local Markdown report saving still happens even when notifications are not configured
 
 ### Q9: Not receiving Telegram push messages?
 
@@ -311,9 +333,32 @@ Work through the following 5 checkpoints in order:
 
 ---
 
+## Desktop App
+
+### Q15: macOS says the desktop app is damaged or cannot be opened?
+
+**Cause**: The current macOS DMG is not signed and notarized with an Apple Developer certificate. After a browser download, macOS Gatekeeper may attach the quarantine attribute and block startup.
+
+**Solution**:
+
+1. Download only from the project's [GitHub Releases](https://github.com/ZhuLinsen/daily_stock_analysis/releases), and select the package matching your Mac architecture. Do not bypass Gatekeeper for third-party copies or files from an untrusted source.
+2. Drag `Daily Stock Analysis` into Applications, then first try **System Settings → Privacy & Security → Open Anyway**.
+3. If it still does not start and you have verified that it came from the official project Release, remove quarantine only from this app and launch it:
+
+   ```bash
+   xattr -dr com.apple.quarantine "/Applications/Daily Stock Analysis.app"
+   open "/Applications/Daily Stock Analysis.app"
+   ```
+
+Replace the path if the app is not in `/Applications`. Never run `xattr` against the entire `/Applications` directory. This is a temporary way to allow a trusted unsigned app; it is not a substitute for signing or notarization. See the [desktop packaging guide](desktop-package.md#macos-提示应用已损坏无法打开) for the complete troubleshooting notes.
+
+> Related Issue: [#2113](https://github.com/ZhuLinsen/daily_stock_analysis/issues/2113)
+
+---
+
 ## Other Issues
 
-### Q15: How to run only market review, without stock analysis?
+### Q16: How to run only market review, without stock analysis?
 
 **Method**:
 ```bash
@@ -326,7 +371,7 @@ python main.py --market-only
 
 ---
 
-### Q16: Buy/Hold/Sell counts in analysis results are incorrect?
+### Q17: Buy/Hold/Sell counts in analysis results are incorrect?
 
 **Cause**: Earlier versions used regex matching for statistics, may not match actual recommendations.
 
@@ -343,4 +388,4 @@ If the above content doesn't solve your issue, welcome to:
 
 ---
 
-*Last updated: 2026-04-20*
+*Last updated: 2026-08-03*
